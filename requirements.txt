@@ -3,4 +3,5 @@ uvicorn
 opencv-python
 numpy
 pillow
+cv2-enumerate-cameras
 chandra-ocr[hf]

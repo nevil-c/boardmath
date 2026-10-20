@@ -27,6 +27,13 @@
   <label>min interval s <input type="number" id="interval" step="0.5" min="0" style="width:4em"></label>
   <label>diff threshold <input type="number" id="diff" step="0.5" min="0" style="width:4em"></label>
 </div>
+<div>
+  <label>camera <select id="cam"><option>loading...</option></select></label>
+  <button id="camscan">rescan</button>
+  <label>or file/URL/index <input id="camsrc" placeholder="e.g. 1 or lecture.mp4" style="width:14em"></label>
+  <button id="camuse">use</button>
+  <span id="camerr" style="color:#c00"></span>
+</div>
 <p id="stats">...</p>
 <div class="row">
   <img src="/video" alt="live camera">
@@ -68,12 +75,26 @@ const sendSettings = () => post("/api/settings", {
 });
 ["bw", "invert", "interval", "diff"].forEach(id => $(id).onchange = sendSettings);
 
+let cams = [];
+async function loadCams() {
+  $("cam").innerHTML = "<option>scanning...</option>";
+  const r = await (await fetch("/api/cameras")).json();
+  cams = r.cameras;
+  $("cam").innerHTML = '<option value="">-- pick a camera --</option>' +
+    cams.map((c, i) => `<option value="${i}"${c.ok ? "" : " disabled"}>${esc(c.label)}${c.ok ? "" : " (no frames)"}</option>`).join("");
+}
+$("cam").onchange = () => { const c = cams[$("cam").value]; if (c) post("/api/camera", c); };
+$("camscan").onclick = loadCams;
+$("camuse").onclick = () => { if ($("camsrc").value.trim()) post("/api/camera", {source: $("camsrc").value}); };
+loadCams();
+
 async function tick() {
   try {
     const s = await (await fetch("/api/state")).json();
     const st = s.stats;
-    $("stats").textContent = `backend=${st.backend} | ${st.status} | snapshots=${st.snapshots} | skipped(unchanged)=${st.skipped} | frame diff ${st.last_diff ?? "-"} | last OCR ${st.last_latency ?? "-"}s | cam ${st.cam_fps} fps | transcript: ${st.transcript}`;
+    $("stats").textContent = `backend=${st.backend} | ${st.status} | snapshots=${st.snapshots} | skipped(unchanged)=${st.skipped} | frame diff ${st.last_diff ?? "-"} | last OCR ${st.last_latency ?? "-"}s | ${st.camera} @ ${st.cam_fps} fps | transcript: ${st.transcript}`;
     $("proc").src = "/processed.jpg?" + Date.now();
+    $("camerr").textContent = st.cam_error || "";
     if (!settingsLoaded) {
       $("bw").checked = s.settings.bw; $("invert").checked = s.settings.invert;
       $("interval").value = s.settings.interval; $("diff").value = s.settings.diff_threshold;

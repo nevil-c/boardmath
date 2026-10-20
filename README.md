@@ -77,7 +77,7 @@ Chandra's own prompt (`ocr_layout`) and output parsers are used for every backen
 | `--max-side` | `1600` | resize long edge before OCR |
 | `--max-tokens` | `2048` | max output tokens per frame |
 
-B&W, invert, interval and diff threshold can also be changed live from the page.
+B&W, invert, interval and diff threshold can also be changed live from the page. The camera picker on the page lists cameras by name, greys out any that give no frames (e.g. OBS Virtual Camera while OBS isn't sending), and also accepts a camera index, video file or stream URL.
 
 ## Files
 

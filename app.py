@@ -58,6 +58,7 @@ state = {
     "last_diff": None,
     "last_latency": None,
     "cam_fps": 0.0,
+    "cam_error": None,
     "status": "starting",
     "paused": False,
 }
@@ -185,21 +186,79 @@ def run_ocr(ocr, gray):
 
 # ---------------------------------------------------------------- threads
 
-def capture_loop():
-    global latest_frame
-    src = int(args.camera) if args.camera.isdigit() else args.camera
-    cap = cv2.VideoCapture(src)
+def list_cameras():
+    """[{index, backend, label}] for the page's camera picker."""
+    cams = []
+    try:
+        from cv2_enumerate_cameras import enumerate_cameras
+        for c in enumerate_cameras():
+            # c.index encodes the backend, e.g. 1400 = MSMF device 0, 701 = DSHOW device 1
+            backend = c.backend or c.index // 100 * 100
+            idx = c.index % 100
+            name = cv2.videoio_registry.getBackendName(backend) if backend else "auto"
+            cams.append({"index": idx, "backend": backend, "label": f"{c.name} ({name} {idx})"})
+    except Exception as e:
+        print("[cam] enumerate failed, probing indices:", e, flush=True)
+    # listed != openable (e.g. OBS Virtual Camera while OBS isn't sending), so test each one
+    for c in cams:
+        if c["index"] == camera["source"] and camera["backend"] in (cv2.CAP_ANY, c["backend"]):
+            c["ok"] = True  # likely the device already open here; a second open could fail
+            continue
+        t = cv2.VideoCapture(c["index"], c["backend"])
+        c["ok"] = t.isOpened() and t.read()[0]
+        t.release()
+    if not cams:  # fallback: probe plain indices, skipping the one already open
+        for i in range(5):
+            if camera["source"] == i:
+                cams.append({"index": i, "backend": cv2.CAP_ANY, "label": f"camera {i}", "ok": True})
+                continue
+            c = cv2.VideoCapture(i)
+            if c.isOpened():
+                cams.append({"index": i, "backend": cv2.CAP_ANY, "label": f"camera {i}", "ok": True})
+            c.release()
+    return cams
+
+
+# current camera, and a pending switch request from the page
+camera = {"source": int(args.camera) if args.camera.isdigit() else args.camera,
+          "backend": cv2.CAP_ANY, "label": f"camera {args.camera}", "resolution": None}
+camera_request = None
+
+
+def open_camera(src, backend):
+    cap = cv2.VideoCapture(src, backend) if isinstance(src, int) else cv2.VideoCapture(src)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
-    if not cap.isOpened():
-        state["status"] = f"cannot open camera {args.camera}"
-        print("[cam]", state["status"], flush=True)
-        return
-    print(f"[cam] {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}",
-          flush=True)
+    return cap
+
+
+def capture_loop():
+    global latest_frame, camera_request
+    cap = open_camera(camera["source"], camera["backend"])
     n, t0 = 0, time.time()
     while True:
+        if camera_request is not None:
+            req, camera_request = camera_request, None
+            cap.release()
+            cap = open_camera(req["source"], req["backend"])
+            if not cap.isOpened():  # fall back to the previous camera
+                state["cam_error"] = f"cannot open {req['label']}, kept previous camera"
+                print("[cam]", state["cam_error"], flush=True)
+                cap = open_camera(camera["source"], camera["backend"])
+            else:
+                state["cam_error"] = None
+                camera.update(req)
+                camera["resolution"] = None
+        if not cap.isOpened():
+            state["cam_error"] = f"cannot open {camera['label']}, pick another camera"
+            time.sleep(0.5)
+            continue
+        if camera["resolution"] is None:
+            camera["resolution"] = (f"{int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x"
+                                    f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+            print(f"[cam] {camera['label']} {camera['resolution']}", flush=True)
         ok, frame = cap.read()
+        src = camera["source"]
         if not ok:
             if not isinstance(src, int):  # loop video files
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -343,6 +402,8 @@ def api_state():
                 "last_diff": state["last_diff"],
                 "last_latency": state["last_latency"],
                 "cam_fps": state["cam_fps"],
+                "camera": f"{camera['label']} {camera['resolution'] or ''}".strip(),
+                "cam_error": state["cam_error"],
                 "transcript": str(transcript_path.relative_to(ROOT)),
             },
             "paused": state["paused"],
@@ -366,6 +427,26 @@ async def api_settings(req: Request):
         if k in body:
             settings[k] = float(body[k])
     return settings
+
+
+@app.get("/api/cameras")
+def api_cameras():
+    return {"cameras": list_cameras(), "current": camera["source"]}
+
+
+@app.post("/api/camera")
+async def api_camera(req: Request):
+    """{index, backend, label} for a device, or {source: "file or URL"}."""
+    global camera_request
+    body = await req.json()
+    if "source" in body:
+        s = str(body["source"]).strip()
+        src = int(s) if s.isdigit() else s
+        camera_request = {"source": src, "backend": cv2.CAP_ANY, "label": f"camera {s}"}
+    else:
+        camera_request = {"source": int(body["index"]), "backend": int(body.get("backend", 0)),
+                          "label": body.get("label") or f"camera {body['index']}"}
+    return {"ok": True}
 
 
 if __name__ == "__main__":
