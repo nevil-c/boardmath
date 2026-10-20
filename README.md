@@ -17,6 +17,9 @@ camera (OpenCV) ─► latest frame ─► preprocess ─► changed? ─► Dat
   - **Hand in the way:** a line partly covered by the hand is ignored.
   - **Misreads:** a line misread on one pass (e.g. `m` → `rn`), at least `--dup-similarity` (default 0.85) similar, is ignored.
   - **What still counts as new:** these merges only happen when the earlier reading just dropped out of view, so two similar lines that are both on the board stay two steps, and on short lines like `x=2` → `x=3` one changed character is a new step.
+  - **Half-written lines wait:** a brand-new line only becomes a step once it reads the same in `--confirm` (default 2) snapshots in a row, so a line you are still writing (which reads differently each time) isn't added until it's finished. If the board then looks unchanged, the app takes the confirming read anyway.
+  - **Rewrites replace stray steps:** if a stray reading slips through anyway (e.g. you paused mid-line) and the finished line appears in the same spot within `--replace-window` (default 30 s), the finished line replaces it.
+  - **Remove by hand:** every step has a × button that removes it; the same reading won't be re-added.
   - Run `python app.py --selftest` to check the checker.
 - Frames whose 160 px thumbnail differs from the last OCR'd frame by less than `--diff-threshold` are skipped, so an unchanged board isn't billed.
 - The page shows the live feed, the exact preprocessed frame that was uploaded, and the steps so far rendered with KaTeX (the newest is highlighted). KaTeX also emits MathML, which screen readers can read. The page also shows pages billed and an estimated cost.
@@ -78,6 +81,8 @@ python app.py --camera 0
 | `--max-side` | `1600` | resize long edge before upload |
 | `--timeout` | `60` | give up on one request after N seconds |
 | `--dup-similarity` | `0.85` | how similar a misread must be to count as the same line; `>1` turns fuzzy matching off |
+| `--confirm` | `2` | identical reads needed before a new line becomes a step; `1` = immediately |
+| `--replace-window` | `30` | seconds in which a vanished step rewritten in the same spot is replaced |
 
 B&W, invert, interval, diff threshold and camera can also be changed live from the page. The camera list uses real names (System Profiler on macOS, cv2-enumerate-cameras on Windows/Linux), greys out cameras that give no frames (e.g. OBS Virtual Camera while OBS isn't sending), and has a rescan button. If a camera fails to open, the page says so and switches back to the last one that worked.
 

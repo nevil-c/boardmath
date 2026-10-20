@@ -18,6 +18,8 @@
   #steps li { margin: 8px 0; }
   #steps li:last-child { background: #ffe; }
   #steps .katex-display { margin: .2em 0; }
+  #steps li { position: relative; }
+  #steps .rm { position: absolute; right: 0; top: 0; font-size: .6em; }
 </style>
 </head>
 <body>
@@ -66,6 +68,10 @@ const fillCameras = (cams, current) => {
     `<option value="${esc(c.id)}"${c.ok === false ? " disabled" : ""}>${esc(c.label)}${c.ok === false ? " (no frames)" : ""}</option>`).join("");
   $("camera").value = current;
 };
+$("steps").onclick = ev => {
+  const n = ev.target.dataset && ev.target.dataset.n;
+  if (n) post("/api/steps/remove", {n: +n}).then(tick);
+};
 $("camscan").onclick = async () => {
   $("camscan").disabled = true; $("camscan").textContent = "scanning...";
   const r = await post("/api/cameras/rescan");
@@ -99,12 +105,14 @@ async function tick() {
     }
     const eqs = s.equations;
     if (s.steps_rev !== lastRev) {   // bumped when a step is added or a half-written one completes
-      $("steps").innerHTML = eqs.map(e => `<li value="${e.n}">${tex(e.latex)}</li>`).join("");
+      // removed steps are hidden; the rest are numbered 1, 2, 3... as shown
+      $("steps").innerHTML = eqs.filter(e => !e.removed).map(e =>
+        `<li>${tex(e.latex)}<button class="rm" data-n="${e.n}" title="remove this step" aria-label="remove step">×</button></li>`).join("");
       lastRev = s.steps_rev;
     }
     if (s.latest && s.latest.id !== lastSnap) {
       lastSnap = s.latest.id;
-      $("boardinfo").textContent = `@ ${s.latest.time} · ${eqs.length} step(s)`;
+      $("boardinfo").textContent = `@ ${s.latest.time} · ${eqs.filter(e => !e.removed).length} step(s)`;
     }
   } catch (err) {
     $("stats").textContent = "server unreachable: " + err;

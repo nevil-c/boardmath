@@ -53,6 +53,12 @@ p.add_argument("--selftest", action="store_true", help="check step ordering and 
 p.add_argument("--dup-similarity", type=float, default=0.85,
                help="a new line this similar (0-1) to one that just dropped out of view is the "
                     "same line misread, not a new step; >1 turns fuzzy matching off")
+p.add_argument("--confirm", type=int, default=2,
+               help="a new line must read the same in this many snapshots in a row before it "
+                    "becomes a step (stops half-written lines); 1 = add immediately")
+p.add_argument("--replace-window", type=float, default=30,
+               help="seconds during which a step that vanishes and is rewritten in the same "
+                    "spot gets replaced instead of kept")
 p.add_argument("--hand", action="store_true",
                help="track the writing hand and order steps by it (off = reading order)")
 args = p.parse_args()
@@ -67,6 +73,7 @@ state = {
     "equations": [],         # ordered unique equations across the lecture
     "key2n": {},             # every canonical key seen -> step number
     "visible": set(),        # step numbers on the board at the last snapshot
+    "pending": {},           # new lines waiting for a confirming read: key -> count
     "steps_rev": 0,          # bumped whenever a step is added or completed
     "snap_count": 0,
     "skipped": 0,
@@ -219,7 +226,8 @@ class MockOCR:
         time.sleep(1.0)  # pretend inference
         blocks = [{"type": "equation", "latex": tex, "text": tex,
                    "box": [x, y, x + 0.55, y + 0.10], "t": 0.0, "hand": None}
-                  for tex, x, y in self.samples[self.i % len(self.samples)]]
+                  # each board is "seen" 3 times in a row, like a real still board
+                  for tex, x, y in self.samples[self.i // 3 % len(self.samples)]]
         self.i += 1
         return blocks
 
@@ -322,12 +330,33 @@ def _same_line(k, vanished, eqs):
     return best
 
 
-def merge_steps(book, steps, when):
+def _overlap(a, b):
+    """Intersection over the smaller box (normalized [x0, y0, x1, y1]); 0 if either is missing."""
+    if not a or not b:
+        return 0.0
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    if w <= 0 or h <= 0:
+        return 0.0
+    small = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return w * h / small if small > 0 else 0.0
+
+
+def merge_steps(book, steps, when, now=None, confirm=None):
     """Fold one snapshot's lines into the step list. Returns (new, updated) items.
 
-    book holds equations, key2n (every key seen -> step number) and visible
-    (step numbers in the previous snapshot); merge_steps updates all three.
+    book holds equations, key2n (every key seen -> step number), visible (step
+    numbers in the previous snapshot) and pending (unconfirmed lines);
+    merge_steps updates all four.
+
+    A brand-new line only becomes a step once it reads the same in `confirm`
+    snapshots in a row, so a line caught mid-writing (which reads differently
+    each time) waits until it's finished. If a step that slipped through
+    anyway disappears and a new line is confirmed in the same spot within
+    --replace-window seconds, the new line replaces it.
     """
+    now = time.time() if now is None else now
+    confirm = args.confirm if confirm is None else confirm
     eqs, key2n = book["equations"], book["key2n"]
     lines = {}
     for b in steps:
@@ -337,6 +366,7 @@ def merge_steps(book, steps, when):
     present = {key2n[k] for k in lines if k in key2n}
     vanished = [n for n in sorted(book["visible"]) if n not in present]
     new, updated, visible = [], [], set(present)
+    pending = {}
     for k, b in lines.items():
         if k in key2n:
             continue
@@ -346,16 +376,41 @@ def merge_steps(book, steps, when):
             key2n[k] = n
             visible.add(n)
             if how == "grew":
-                eqs[n - 1].update(latex=b["latex"], key=k)
+                eqs[n - 1].update(latex=b["latex"], key=k, box=b.get("box"))
                 updated.append(eqs[n - 1])
             continue
-        item = {"n": len(eqs) + 1, "time": when, "latex": b["latex"], "hand": b["hand"], "key": k}
+        count = book["pending"].get(k, 0) + 1
+        if count < confirm:
+            pending[k] = count   # wait for another identical read
+            continue
+        # a young step that's gone from the board, in the same spot = this line half-written
+        old = next((e for e in reversed(eqs)
+                    if not e.get("removed") and e["n"] not in present and e["n"] not in visible
+                    and now - e["added"] <= args.replace_window
+                    and _overlap(e.get("box"), b.get("box")) > 0.5), None)
+        if old is not None:
+            old.update(latex=b["latex"], key=k, box=b.get("box"))
+            key2n[k] = old["n"]
+            visible.add(old["n"])
+            updated.append(old)
+            continue
+        item = {"n": len(eqs) + 1, "time": when, "latex": b["latex"], "hand": b["hand"],
+                "key": k, "box": b.get("box"), "added": now}
         eqs.append(item)
         key2n[k] = item["n"]
         visible.add(item["n"])
         new.append(item)
     book["visible"] = visible
+    book["pending"] = pending
     return new, updated
+
+
+def remove_step(book, n):
+    """Hide step n. Its readings stay in key2n, so the same line isn't re-added."""
+    e = book["equations"][n - 1]
+    e["removed"] = True
+    book["visible"].discard(n)
+    return e
 
 
 BLOCK_TYPES = {"equation", "text", "sectionheader", "listitem"}
@@ -436,10 +491,10 @@ def _selftest():
 
 def _selftest_dups():
     """The duplicate checker: re-reads merge, genuinely different lines don't."""
-    book = {"equations": [], "key2n": {}, "visible": set()}
+    book = {"equations": [], "key2n": {}, "visible": set(), "pending": {}}
 
-    def snap(*lines):
-        new, upd = merge_steps(book, [{"latex": x, "hand": None} for x in lines], "t")
+    def snap(*lines):   # confirm=1: these cases are about matching, not confirmation
+        new, upd = merge_steps(book, [{"latex": x, "hand": None} for x in lines], "t", confirm=1)
         return [e["latex"] for e in new], [(e["n"], e["latex"]) for e in upd]
 
     assert canon(r"x^{2} + \frac{a}{b}.") == canon(r"x^2+\frac a b") == canon(r"x^2 +\dfrac{a}{b}")
@@ -458,6 +513,44 @@ def _selftest_dups():
     assert snap("x=3") == (["x=3"], []), "short lines: one changed character is a real change"
     assert [e["latex"] for e in book["equations"]] == \
         [F, "x^{2}+1", "y=2x+1", "y=2x+1+z", "x=2", "x=3"]
+    _selftest_midwriting()
+
+
+def _selftest_midwriting():
+    """Half-written lines: wait for a confirming read; replace one that slipped through."""
+    book = {"equations": [], "key2n": {}, "visible": set(), "pending": {}}
+    row = lambda i: [.1, .1 * i, .5, .1 * i + .08]  # noqa: E731
+    board = [("y=mx+b", 0), ("a=4", 1)]
+
+    def snap(t, *extra):
+        lines = [{"latex": x, "hand": None, "box": row(r)} for x, r in board + list(extra)]
+        new, upd = merge_steps(book, lines, "t", now=t, confirm=2)
+        return [e["latex"] for e in new], [(e["n"], e["latex"]) for e in upd]
+
+    assert snap(0) == ([], []), "first read only queues the lines"
+    assert snap(1) == (["y=mx+b", "a=4"], [])
+    # writing C=12 on row 4: the half-drawn reads differ each time, so none is confirmed
+    assert snap(2, ("a=u", 4)) == ([], [])
+    assert snap(3, ("C=1", 4)) == ([], [])
+    assert snap(4, ("C=12", 4)) == ([], [])
+    assert snap(5, ("C=12", 4)) == (["C=12"], []), "finished line confirmed"
+    board.append(("C=12", 4))
+    # writer paused mid-line, so a garbage read got confirmed...
+    assert snap(6, ("Z=\\sqrt{u}", 5)) == ([], [])
+    assert snap(7, ("Z=\\sqrt{u}", 5)) == (["Z=\\sqrt{u}"], [])
+    # ...then the finished line, unrelated text but the same spot, replaces it
+    assert snap(8, ("Z=-17", 5)) == ([], [])
+    assert snap(9, ("Z=-17", 5)) == ([], [(4, "Z=-17")]), "same spot replaces the garbage step"
+    board.append(("Z=-17", 5))
+    # outside the replace window, a rewrite in the same spot is a new step
+    assert snap(50, ("q=1", 5)) == ([], [])
+    board.pop()
+    assert snap(51, ("q=1", 5)) == (["q=1"], [])
+    # removed by hand: the same reading doesn't come back
+    remove_step(book, 3)
+    assert snap(52, ("q=1", 5)) == ([], [])
+    assert [e["latex"] for e in book["equations"] if not e.get("removed")] == \
+        ["y=mx+b", "a=4", "Z=-17", "q=1"]
 
 
 if args.selftest:
@@ -536,6 +629,7 @@ def ocr_loop(ocr):
     last_thumb = None
     last_sent = 0.0
     prev_shot = 0.0
+    forced = 0  # extra reads of an unchanged board, to confirm pending lines
     state["status"] = "running"
     while True:
         if state["paused"] or latest_frame is None:
@@ -552,7 +646,11 @@ def ocr_loop(ocr):
         if last_thumb is not None and th.shape == last_thumb.shape:
             diff = float(np.abs(th - last_thumb).mean())
             state["last_diff"] = round(diff, 2)
-            if diff < settings["diff_threshold"]:
+            if diff >= settings["diff_threshold"]:
+                forced = 0
+            elif state["pending"] and forced < args.confirm:
+                forced += 1  # board looks unchanged, but a new line still needs confirming
+            else:
                 state["skipped"] += 1
                 time.sleep(0.2)
                 continue
@@ -589,7 +687,7 @@ def add_snapshot(steps, dt, shot_t):
             state["steps_rev"] += 1
         snap["steps"] = new
     print(f"[ocr] #{snap['id']} {dt:.2f}s, {len(steps)} on board, {len(new)} new, "
-          f"{len(updated)} completed", flush=True)
+          f"{len(updated)} completed, {len(state['pending'])} waiting to confirm", flush=True)
     if new or updated:   # empty board writes nothing, so the transcript stays blank too
         TRANSCRIPTS.mkdir(exist_ok=True)
         with open(transcript_path, "a", encoding="utf-8") as f:
@@ -684,6 +782,20 @@ def api_cameras_rescan():
     global CAMERAS
     CAMERAS = list_cameras(in_use=settings["camera"])
     return {"cameras": CAMERAS}
+
+
+@app.post("/api/steps/remove")
+async def api_remove_step(req: Request):
+    n = int((await req.json())["n"])
+    with lock:
+        if not 1 <= n <= len(state["equations"]):
+            return {"ok": False}
+        e = remove_step(state, n)
+        state["steps_rev"] += 1
+    TRANSCRIPTS.mkdir(exist_ok=True)
+    with open(transcript_path, "a", encoding="utf-8") as f:
+        f.write(f"{n}. (removed) ${e['latex']}$\n\n")
+    return {"ok": True}
 
 
 @app.post("/api/pause")
