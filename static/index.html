@@ -6,22 +6,25 @@
 <title>BoardMath</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/katex.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.11/contrib/auto-render.min.js"></script>
 <style>
   body { font-family: sans-serif; margin: 8px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
-  .row img { width: 48%; min-width: 300px; border: 1px solid #888; background: #eee; }
-  pre { background: #f4f4f4; padding: 6px; white-space: pre-wrap; }
-  #rendered { font-size: 1.4em; border: 1px solid #ccc; padding: 6px; min-height: 2em; }
-  #eqs li { margin: 6px 0; cursor: pointer; }
-  #eqs li.sel { background: #ffe; }
-  #eqs code { color: #555; font-size: .85em; }
+  .row > div { width: 48%; min-width: 300px; position: relative; }
+  .row img { width: 100%; display: block; border: 1px solid #888; background: #eee; }
+  #hand { position: absolute; width: 18px; height: 18px; margin: -9px 0 0 -9px;
+          border: 2px solid #e33; border-radius: 50%; background: rgba(238,51,51,.3);
+          pointer-events: none; display: none; }
+  #steps { padding-left: 1.8em; font-size: 1.35em; }
+  #steps li { margin: 8px 0; }
+  #steps li:last-child { background: #ffe; }
+  #steps .katex-display { margin: .2em 0; }
 </style>
 </head>
 <body>
 <h3>BoardMath</h3>
 <div>
   <button id="pause">pause</button>
+  <label>camera <select id="camera"></select></label>
   <label><input type="checkbox" id="bw"> B&amp;W threshold</label>
   <label><input type="checkbox" id="invert"> invert (blackboard)</label>
   <label>min interval s <input type="number" id="interval" step="0.5" min="0" style="width:4em"></label>
@@ -29,31 +32,17 @@
 </div>
 <p id="stats">...</p>
 <div class="row">
-  <img src="/video" alt="live camera">
-  <img id="proc" alt="preprocessed frame sent to OCR">
+  <div><img src="/video" alt="live camera"><div id="hand"></div></div>
+  <div><img id="proc" alt="frame sent to OCR"></div>
 </div>
 
-<h4>Latest snapshot <span id="snapinfo"></span></h4>
-<div id="rendered" aria-live="polite"></div>
-<pre id="raw"></pre>
-
-<h4>Lecture equations (newest first)</h4>
-<ol id="eqs" reversed></ol>
+<h4>Steps <small id="boardinfo"></small></h4>
+<ol id="steps" aria-live="polite"></ol>
 
 <script>
 const $ = id => document.getElementById(id);
-const opts = {
-  delimiters: [
-    {left: "$$", right: "$$", display: true},
-    {left: "\\[", right: "\\]", display: true},
-    {left: "\\(", right: "\\)", display: false},
-    {left: "$", right: "$", display: false},
-  ],
-  output: "htmlAndMathml",   // MathML for screen readers
-  throwOnError: false,
-};
 const esc = s => s.replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
-const tex = (latex, display) => katex.renderToString(latex, {displayMode: display, output: "htmlAndMathml", throwOnError: false});
+const tex = latex => katex.renderToString(latex, {displayMode: true, output: "htmlAndMathml", throwOnError: false});
 
 let lastSnap = 0, lastEqCount = 0, settingsLoaded = false;
 
@@ -63,10 +52,11 @@ async function post(url, body) {
 }
 $("pause").onclick = async () => { const r = await post("/api/pause"); $("pause").textContent = r.paused ? "resume" : "pause"; };
 const sendSettings = () => post("/api/settings", {
+  camera: $("camera").value,
   bw: $("bw").checked, invert: $("invert").checked,
   interval: $("interval").value, diff_threshold: $("diff").value,
 });
-["bw", "invert", "interval", "diff"].forEach(id => $(id).onchange = sendSettings);
+["camera", "bw", "invert", "interval", "diff"].forEach(id => $(id).onchange = sendSettings);
 
 async function tick() {
   try {
@@ -74,34 +64,30 @@ async function tick() {
     const st = s.stats;
     $("stats").textContent = `backend=${st.backend} | ${st.status} | snapshots=${st.snapshots} | skipped(unchanged)=${st.skipped} | frame diff ${st.last_diff ?? "-"} | last OCR ${st.last_latency ?? "-"}s | pages ${st.pages_billed} (~$${st.est_cost}) | cam ${st.cam_fps} fps | transcript: ${st.transcript}`;
     $("proc").src = "/processed.jpg?" + Date.now();
+    const h = $("hand");
+    if (s.hand) {
+      h.style.left = (s.hand[0] * 100) + "%";
+      h.style.top = (s.hand[1] * 100) + "%";
+      h.style.display = "block";
+    } else {
+      h.style.display = "none";
+    }
     if (!settingsLoaded) {
+      $("camera").innerHTML = (s.cameras || []).map(c => `<option value="${esc(c.id)}">${esc(c.label)}</option>`).join("");
+      $("camera").value = s.settings.camera;
       $("bw").checked = s.settings.bw; $("invert").checked = s.settings.invert;
       $("interval").value = s.settings.interval; $("diff").value = s.settings.diff_threshold;
       $("pause").textContent = s.paused ? "resume" : "pause";
       settingsLoaded = true;
     }
+    const eqs = s.equations;
+    if (eqs.length !== lastEqCount) {   // backend only appends lines it hasn't sent before
+      $("steps").innerHTML = eqs.map(e => `<li value="${e.n}">${tex(e.latex)}</li>`).join("");
+      lastEqCount = eqs.length;
+    }
     if (s.latest && s.latest.id !== lastSnap) {
       lastSnap = s.latest.id;
-      $("snapinfo").textContent = `#${s.latest.id} @ ${s.latest.time} (${s.latest.latency}s)`;
-      $("raw").textContent = s.latest.markdown;
-      $("rendered").innerHTML = esc(s.latest.markdown).replace(/\n/g, "<br>");
-      renderMathInElement($("rendered"), opts);
-    }
-    if (s.equations.length !== lastEqCount) {
-      for (const e of s.equations.slice(lastEqCount)) {
-        const li = document.createElement("li");
-        li.value = e.n;
-        li.innerHTML = `<span>${tex(e.latex, true)}</span><code>${esc(e.latex)}</code> <small>${e.time}</small>`;
-        li.onclick = () => {
-          document.querySelectorAll("#eqs li.sel").forEach(x => x.classList.remove("sel"));
-          li.classList.add("sel");
-          $("rendered").innerHTML = tex(e.latex, true);
-          $("raw").textContent = e.latex;
-          $("snapinfo").textContent = `equation ${e.n} @ ${e.time} (selected; next snapshot replaces this)`;
-        };
-        $("eqs").prepend(li);
-      }
-      lastEqCount = s.equations.length;
+      $("boardinfo").textContent = `@ ${s.latest.time} · ${eqs.length} step(s)`;
     }
   } catch (err) {
     $("stats").textContent = "server unreachable: " + err;

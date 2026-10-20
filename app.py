@@ -4,15 +4,19 @@ camera -> latest frame -> preprocess -> change check -> Datalab (Chandra) -> LaT
 """
 
 import argparse
+from collections import deque
 import io
+import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
+from bs4 import BeautifulSoup
 import cv2
 import numpy as np
 import requests
@@ -44,6 +48,9 @@ p.add_argument("--timeout", type=float, default=60, help="give up on one API req
 p.add_argument("--host", default="127.0.0.1")
 p.add_argument("--port", type=int, default=8000)
 p.add_argument("--once", metavar="IMAGE", help="OCR a single image, print result, exit")
+p.add_argument("--selftest", action="store_true", help="check step ordering and exit")
+p.add_argument("--hand", action="store_true",
+               help="track the writing hand and order steps by it (off = reading order)")
 args = p.parse_args()
 
 # ---------------------------------------------------------------- shared state
@@ -61,17 +68,39 @@ state = {
     "pages_billed": 0,
     "est_cost": 0.0,
     "last_latency": None,
+    "hand": None,            # latest normalized [x, y] of the moving hand, or None
+    "hand_t": 0.0,
     "cam_fps": 0.0,
     "status": "starting",
     "paused": False,
 }
 settings = {
+    "camera": str(args.camera),
     "bw": args.bw,
     "invert": args.invert,
     "interval": args.interval,
     "diff_threshold": args.diff_threshold,
 }
 latest_frame = None  # raw BGR ndarray, written by capture thread
+
+
+def list_cameras():
+    cams = []
+    try:
+        out = subprocess.check_output(["system_profiler", "SPCameraDataType", "-json"], timeout=5)
+        for i, c in enumerate(json.loads(out).get("SPCameraDataType", [])):
+            name = c.get("_name", f"Camera {i}")
+            model = c.get("spcamera_model-id", "")
+            label = f"{i}: {name}" + (f" ({model})" if "iPhone" in model and model not in name else "")
+            cams.append({"id": str(i), "label": label})
+    except Exception:
+        cams = [{"id": str(i), "label": f"Camera {i}"} for i in range(4)]
+    if not any(c["id"] == str(args.camera) for c in cams):
+        cams.append({"id": str(args.camera), "label": str(args.camera)})
+    return cams
+
+
+CAMERAS = list_cameras()
 
 TRANSCRIPTS = ROOT / "transcripts"
 transcript_path = TRANSCRIPTS / f"lecture_{datetime.now():%Y%m%d_%H%M%S}.md"
@@ -105,14 +134,38 @@ def thumb(gray):
     return cv2.GaussianBlur(t, (5, 5), 0).astype(np.int16)
 
 
+# ---------------------------------------------------------------- hand tracking
+
+HAND_HIST = deque(maxlen=3600)   # (t, x, y) normalized, oldest first
+
+
+def find_hand(prev, cur):
+    """Largest blob that moved between two small grayscale frames -> normalized (x, y).
+
+    On a board the only thing that moves that size is the writing hand. ponytail:
+    no hand model, just motion — swap in mediapipe if the arm/person keeps winning.
+    """
+    d = cv2.absdiff(prev, cur)
+    d = cv2.threshold(cv2.GaussianBlur(d, (5, 5), 0), 18, 255, cv2.THRESH_BINARY)[1]
+    d = cv2.dilate(d, np.ones((7, 7), np.uint8), iterations=1)
+    n, _, stats, cents = cv2.connectedComponentsWithStats(d)
+    if n < 2:
+        return None
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    if not 0.0008 < stats[i, cv2.CC_STAT_AREA] / d.size < 0.2:
+        return None   # nothing moved, or the whole room moved
+    h, w = prev.shape
+    return [round(float(cents[i][0]) / w, 4), round(float(cents[i][1]) / h, 4)]
+
+
 # ---------------------------------------------------------------- OCR backends
 
 class MockOCR:
     samples = [
-        "Newton's second law\n\n$$F = ma$$\n\nwith $a = \\frac{dv}{dt}$",
-        "$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$",
-        "Euler: $$e^{i\\pi} + 1 = 0$$",
-        "$$\\nabla \\cdot \\mathbf{E} = \\frac{\\rho}{\\varepsilon_0}$$",
+        [("F = ma", .06, .10), ("a = \\frac{dv}{dt}", .06, .30)],
+        [("\\int_0^1 x^2\\,dx = \\frac{1}{3}", .05, .20)],
+        [("e^{i\\pi} + 1 = 0", .10, .45)],
+        [("\\nabla \\cdot \\mathbf{E} = \\frac{\\rho}{\\varepsilon_0}", .04, .60)],
     ]
 
     def __init__(self):
@@ -120,9 +173,11 @@ class MockOCR:
 
     def __call__(self, pil):
         time.sleep(1.0)  # pretend inference
-        md = self.samples[self.i % len(self.samples)]
+        blocks = [{"type": "equation", "latex": tex, "text": tex,
+                   "box": [x, y, x + 0.55, y + 0.10], "t": 0.0, "hand": None}
+                  for tex, x, y in self.samples[self.i % len(self.samples)]]
         self.i += 1
-        return md, md
+        return blocks
 
 
 class DatalabOCR:
@@ -147,7 +202,7 @@ class DatalabOCR:
         r = self.s.post(
             DATALAB_URL,
             files={"file": ("board.png", buf.getvalue(), "image/png")},
-            data={"output_format": "markdown", "mode": args.mode,
+            data={"output_format": "json", "mode": args.mode,
                   "disable_image_extraction": "true"},
             timeout=30,
         )
@@ -168,70 +223,148 @@ class DatalabOCR:
                 raise RuntimeError(f"timed out after {args.timeout}s")
         if not res.get("success", True):
             raise RuntimeError(res.get("error") or "conversion failed")
-        if res.get("markdown") is None and res.get("result_url"):
+        if res.get("json") is None and res.get("result_url"):
             # result_url is self-authorizing: don't send the API key there
             res = requests.get(res["result_url"], timeout=30).json()
         pages = res.get("page_count") or 1
         with lock:
             state["pages_billed"] += pages
             state["est_cost"] += pages * self.PRICE_PER_PAGE[args.mode]
-        md = res.get("markdown") or ""
-        return md, md
-
-
-MATH_RE = re.compile(
-    r"\$\$(.+?)\$\$|\\\[(.+?)\\\]|\\\((.+?)\\\)|(?<![\\$])\$(?!\$)(.+?)(?<![\\$])\$|<math[^>]*>(.+?)</math>",
-    re.S,
-)
-
-
-def extract_equations(*texts):
-    eqs = []
-    for t in texts:
-        for m in MATH_RE.finditer(t or ""):
-            e = next(g for g in m.groups() if g is not None).strip()
-            if e and e not in eqs:
-                eqs.append(e)
-        if eqs:
-            break  # markdown had math; don't double count from raw
-    return eqs
+        return blocks_from_json(res.get("json"), (pil.width, pil.height))
 
 
 def norm(e):
     return re.sub(r"\s+", "", e)
 
 
+BLOCK_TYPES = {"equation", "text", "sectionheader", "listitem"}
+
+
+def blocks_from_json(page, size):
+    """Datalab's json page tree -> flat blocks, LaTeX only where there is math.
+
+    Prose blocks (image captions like "A horizontal blackboard with a chalk
+    sketch of a horse") keep their text but get no latex, so they never become
+    a step and an empty board renders blank.
+    """
+    w, h = size
+    out, stack = [], list((page or {}).get("children") or [])
+    while stack:
+        b = stack.pop()
+        stack.extend(b.get("children") or [])
+        kind = (b.get("block_type") or "").lower()
+        if kind not in BLOCK_TYPES:
+            continue
+        soup = BeautifulSoup(b.get("html") or "", "html.parser")
+        latex = " ".join(" ".join(m.get_text(" ").split()) for m in soup.find_all("math"))
+        x0, y0, x1, y1 = (b.get("bbox") or [0, 0, w, h])[:4]
+        out.append({"type": kind, "latex": latex.strip(),
+                    "text": " ".join(soup.get_text(" ").split()),
+                    "box": [x0 / w, y0 / h, x1 / w, y1 / h],
+                    "t": 0.0, "hand": None})
+    return out
+
+
+def order_steps(blocks, start, now):
+    """Order this snapshot's equations by when the hand wrote them.
+
+    start..now is the window since the previous OCR, so the hand crossing the
+    board earlier in the lecture can't reorder an equation that was already up.
+    No hand visit -> fall back to reading order, after the written ones.
+    """
+    def wrote_at(box):
+        x0, y0, x1, y1 = box
+        for t, x, y in HAND_HIST:
+            if t > start and x0 - .01 <= x <= x1 + .01 and y0 - .01 <= y <= y1 + .01:
+                return t, [x, y]
+        return now + y0, None   # reading order: lower rows sort later
+
+    steps = []
+    for b in blocks:
+        if not b.get("latex"):
+            continue
+        b["t"], b["hand"] = wrote_at(b["box"])
+        steps.append(b)
+    steps.sort(key=lambda b: b["t"])
+    return steps
+
+
 def run_ocr(ocr, gray):
     pil = Image.fromarray(gray).convert("RGB")
     t0 = time.time()
-    md, raw = ocr(pil)
-    dt = time.time() - t0
-    return md, extract_equations(md, raw), dt
+    blocks = ocr(pil)
+    return blocks, time.time() - t0
+
+
+def _selftest():
+    """Hand order beats OCR order; a visit before the last snapshot can't reorder."""
+    HAND_HIST.clear()
+    HAND_HIST.extend([(10.0, .1, .1), (11.0, .5, .5)])
+    blocks = [{"latex": "b", "box": [.45, .45, .6, .6]},
+              {"latex": "a", "box": [.05, .05, .2, .2]},
+              {"latex": "c", "box": [.05, .7, .2, .8]}]
+    assert [b["latex"] for b in order_steps(blocks, 0, 12)] == ["a", "b", "c"]
+    assert [b["latex"] for b in order_steps(blocks, 10.5, 12)] == ["b", "a", "c"]
+    caption = {"block_type": "Text", "bbox": [0, 0, 10, 10],
+               "html": "<p>A horizontal blackboard with a chalk sketch of a horse.</p>"}
+    got = blocks_from_json({"children": [caption]}, (10, 10))
+    assert got[0]["latex"] == "" and "horse" in got[0]["text"], got
+    assert order_steps(got, 0, 12) == [], "a caption must not become a step"
+
+
+if args.selftest:
+    _selftest()
+    print("selftest ok")
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------- threads
 
 def capture_loop():
     global latest_frame
-    src = int(args.camera) if args.camera.isdigit() else args.camera
-    cap = cv2.VideoCapture(src)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
-    if not cap.isOpened():
-        state["status"] = f"cannot open camera {args.camera}"
-        print("[cam]", state["status"], flush=True)
-        return
-    print(f"[cam] {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}",
-          flush=True)
+    cur_cam = None
+    cap = None
+    prev_small = None
     n, t0 = 0, time.time()
     while True:
+        if settings["camera"] != cur_cam:
+            if cap is not None:
+                cap.release()
+            cur_cam = settings["camera"]
+            latest_frame = None
+            src = int(cur_cam) if cur_cam.isdigit() else cur_cam
+            cap = cv2.VideoCapture(src)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
+            if not cap.isOpened():
+                state["status"] = f"cannot open camera {cur_cam}"
+                print("[cam]", state["status"], flush=True)
+                cap.release()
+                cap = None
+                time.sleep(0.5)
+                continue
+            print(f"[cam] #{cur_cam} {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}",
+                  flush=True)
+            n, t0 = 0, time.time()
+        if cap is None:
+            time.sleep(0.2)
+            continue
         ok, frame = cap.read()
         if not ok:
-            if not isinstance(src, int):  # loop video files
+            if not cur_cam.isdigit():  # loop video files
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             time.sleep(0.05)
             continue
         latest_frame = frame
+        if args.hand:
+            g_small = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (240, 160))
+            if prev_small is not None:
+                pos = find_hand(prev_small, g_small)
+                if pos:
+                    HAND_HIST.append((time.time(), *pos))
+                    with lock:
+                        state["hand"], state["hand_t"] = pos, time.time()
+            prev_small = g_small
         n += 1
         if n % 3 == 0:  # preview jpeg at reduced rate/size
             small = cv2.resize(frame, (960, int(960 * frame.shape[0] / frame.shape[1])))
@@ -245,6 +378,7 @@ def capture_loop():
 def ocr_loop(ocr):
     last_thumb = None
     last_sent = 0.0
+    prev_shot = 0.0
     state["status"] = "running"
     while True:
         if state["paused"] or latest_frame is None:
@@ -254,6 +388,7 @@ def ocr_loop(ocr):
         if wait > 0:
             time.sleep(min(wait, 0.1))
             continue
+        shot_t = time.time()
         gray, th = preprocess(latest_frame)
         with lock:
             state["proc_jpg"] = cv2.imencode(".jpg", gray)[1].tobytes()
@@ -264,44 +399,49 @@ def ocr_loop(ocr):
                 state["skipped"] += 1
                 time.sleep(0.2)
                 continue
-        last_sent = time.time()
+        last_sent = shot_t
         state["status"] = "ocr..."
         try:
-            md, eqs, dt = run_ocr(ocr, gray)
+            blocks, dt = run_ocr(ocr, gray)
+            steps = order_steps(blocks, prev_shot, shot_t)
         except Exception as e:
             state["status"] = f"ocr error: {e}"
             print("[ocr]", state["status"], flush=True)
             time.sleep(1)
             continue
         last_thumb = th
-        add_snapshot(md, eqs, dt)
+        add_snapshot(steps, dt, shot_t)
+        prev_shot = shot_t
         state["status"] = "running"
 
 
-def add_snapshot(md, eqs, dt):
+def add_snapshot(steps, dt, shot_t):
     with lock:
         state["snap_count"] += 1
         snap = {
             "id": state["snap_count"],
             "time": datetime.now().strftime("%H:%M:%S"),
             "latency": round(dt, 2),
-            "markdown": md,
-            "equations": eqs,
+            "steps": [{"latex": b["latex"], "hand": b["hand"]} for b in steps],
         }
         state["latest"] = snap
         state["last_latency"] = snap["latency"]
         new = []
-        for e in eqs:
-            k = norm(e)
+        for b in steps:              # whole board comes back; only unseen lines are steps
+            k = norm(b["latex"])
             if k not in state["seen"]:
                 state["seen"].add(k)
-                item = {"n": len(state["equations"]) + 1, "time": snap["time"], "latex": e}
+                item = {"n": len(state["equations"]) + 1, "time": snap["time"],
+                        "latex": b["latex"], "hand": b["hand"]}
                 state["equations"].append(item)
                 new.append(item)
-    print(f"[ocr] #{snap['id']} {dt:.2f}s, {len(eqs)} eqs, {len(new)} new", flush=True)
-    TRANSCRIPTS.mkdir(exist_ok=True)
-    with open(transcript_path, "a", encoding="utf-8") as f:
-        f.write(f"## Snapshot {snap['id']} @ {snap['time']} ({dt:.2f}s)\n\n{md}\n\n")
+        snap["steps"] = new
+    print(f"[ocr] #{snap['id']} {dt:.2f}s, {len(steps)} on board, {len(new)} new", flush=True)
+    if new:   # empty board writes nothing, so the transcript stays blank too
+        TRANSCRIPTS.mkdir(exist_ok=True)
+        with open(transcript_path, "a", encoding="utf-8") as f:
+            f.write(f"## Snapshot {snap['id']} @ {snap['time']} ({dt:.2f}s)\n\n"
+                    + "\n".join(f"{e['n']}. ${e['latex']}$" for e in new) + "\n\n")
 
 
 # ---------------------------------------------------------------- one-shot mode
@@ -317,10 +457,13 @@ if args.once:
     ocr = make_ocr()
     gray, _ = preprocess(img)
     cv2.imwrite(str(ROOT / "once_processed.png"), gray)
-    md, eqs, dt = run_ocr(ocr, gray)
-    print(f"--- markdown ({dt:.2f}s) ---\n{md}\n--- equations ---")
-    for e in eqs:
-        print(e)
+    blocks, dt = run_ocr(ocr, gray)
+    steps = order_steps(blocks, 0, time.time())
+    print(f"--- {len(steps)} steps ({dt:.2f}s) ---")
+    for i, b in enumerate(steps, 1):
+        print(f"{i}. {b['latex']}")
+    if not steps:
+        print("(blank board: no math detected, nothing to show)")
     sys.exit(0)
 
 # ---------------------------------------------------------------- web server
@@ -361,6 +504,7 @@ def api_state():
         return {
             "latest": state["latest"],
             "equations": state["equations"],
+            "hand": state["hand"] if time.time() - state["hand_t"] < 2 else None,
             "stats": {
                 "status": state["status"],
                 "backend": args.backend + ("/" + args.mode if args.backend == "datalab" else ""),
@@ -375,6 +519,7 @@ def api_state():
             },
             "paused": state["paused"],
             "settings": settings,
+            "cameras": CAMERAS,
         }
 
 
@@ -387,6 +532,8 @@ def api_pause():
 @app.post("/api/settings")
 async def api_settings(req: Request):
     body = await req.json()
+    if "camera" in body:
+        settings["camera"] = str(body["camera"])
     for k in ("bw", "invert"):
         if k in body:
             settings[k] = bool(body[k])

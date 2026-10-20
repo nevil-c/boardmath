@@ -11,10 +11,11 @@ camera (OpenCV) ─► latest frame ─► preprocess ─► changed? ─► Dat
 ```
 
 - One API request is in flight at a time. `--interval` (default 2.5 s) keeps you under the free tier's 25 requests/min.
+- Every request OCRs the whole board. Lines already on the list are subtracted, so a re-read of the same board adds nothing and the steps never repeat.
 - Frames whose 160 px thumbnail differs from the last OCR'd frame by less than `--diff-threshold` are skipped, so an unchanged board isn't billed.
-- The page shows the live feed, the exact preprocessed frame that was uploaded, the raw LaTeX/markdown, and that output rendered with KaTeX. KaTeX also emits MathML, which screen readers can read. The page also shows pages billed and an estimated cost.
-- Every unique equation goes into a clickable lecture history, so you can navigate back.
-- Every snapshot is appended to `transcripts/lecture_<timestamp>.md`.
+- The page shows the live feed, the exact preprocessed frame that was uploaded, and the steps so far rendered with KaTeX (the newest is highlighted). KaTeX also emits MathML, which screen readers can read. The page also shows pages billed and an estimated cost.
+- An empty board produces no step: nothing is rendered, no description of the photograph.
+- Every new step is appended to `transcripts/lecture_<timestamp>.md` with its step number.
 
 ## Cost
 
