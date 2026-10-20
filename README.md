@@ -72,7 +72,7 @@ python app.py --camera 0
 | `--max-side` | `1600` | resize long edge before upload |
 | `--timeout` | `60` | give up on one request after N seconds |
 
-B&W, invert, interval and diff threshold can also be changed live from the page.
+B&W, invert, interval, diff threshold and camera can also be changed live from the page. The camera list uses real names (System Profiler on macOS, cv2-enumerate-cameras on Windows/Linux), greys out cameras that give no frames (e.g. OBS Virtual Camera while OBS isn't sending), and has a rescan button. If a camera fails to open, the page says so and switches back to the last one that worked.
 
 ## Files
 

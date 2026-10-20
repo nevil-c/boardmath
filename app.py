@@ -71,6 +71,7 @@ state = {
     "hand": None,            # latest normalized [x, y] of the moving hand, or None
     "hand_t": 0.0,
     "cam_fps": 0.0,
+    "cam_error": None,
     "status": "starting",
     "paused": False,
 }
@@ -84,19 +85,56 @@ settings = {
 latest_frame = None  # raw BGR ndarray, written by capture thread
 
 
-def list_cameras():
+def open_cam(cam_id):
+    """Camera id -> VideoCapture. Ids: "0" (index), "0@1400" (index@backend), or a file/URL."""
+    if "@" in cam_id and cam_id.replace("@", "").isdigit():
+        idx, backend = map(int, cam_id.split("@"))
+        return cv2.VideoCapture(idx, backend)
+    return cv2.VideoCapture(int(cam_id) if cam_id.isdigit() else cam_id)
+
+
+def _mac_cameras():
+    out = subprocess.check_output(["system_profiler", "SPCameraDataType", "-json"], timeout=5)
+    cams = []
+    for i, c in enumerate(json.loads(out).get("SPCameraDataType", [])):
+        name = c.get("_name", f"Camera {i}")
+        model = c.get("spcamera_model-id", "")
+        label = f"{i}: {name}" + (f" ({model})" if "iPhone" in model and model not in name else "")
+        cams.append({"id": str(i), "label": label})
+    return cams
+
+
+def _named_cameras():
+    """Windows/Linux names. c.index encodes the backend, e.g. 1400 = MSMF device 0."""
+    from cv2_enumerate_cameras import enumerate_cameras
+    cams = []
+    for c in enumerate_cameras():
+        backend = c.backend or c.index // 100 * 100
+        idx = c.index % 100
+        api = cv2.videoio_registry.getBackendName(backend) if backend else "auto"
+        cams.append({"id": f"{idx}@{backend}", "label": f"{c.name} ({api} {idx})"})
+    return cams
+
+
+def list_cameras(in_use=None):
     cams = []
     try:
-        out = subprocess.check_output(["system_profiler", "SPCameraDataType", "-json"], timeout=5)
-        for i, c in enumerate(json.loads(out).get("SPCameraDataType", [])):
-            name = c.get("_name", f"Camera {i}")
-            model = c.get("spcamera_model-id", "")
-            label = f"{i}: {name}" + (f" ({model})" if "iPhone" in model and model not in name else "")
-            cams.append({"id": str(i), "label": label})
-    except Exception:
+        cams = _mac_cameras() if sys.platform == "darwin" else _named_cameras()
+    except Exception as e:
+        print("[cam] camera names unavailable:", e, flush=True)
+    if not cams:
         cams = [{"id": str(i), "label": f"Camera {i}"} for i in range(4)]
     if not any(c["id"] == str(args.camera) for c in cams):
-        cams.append({"id": str(args.camera), "label": str(args.camera)})
+        cams.append({"id": str(args.camera), "label": f"{args.camera} (from --camera)"})
+    # listed != working (e.g. OBS Virtual Camera while OBS isn't sending), so grab one frame.
+    # The camera already open here is skipped: a second open of it could fail.
+    for c in cams:
+        if c["id"] == in_use:
+            c["ok"] = True
+            continue
+        cap = open_cam(c["id"])
+        c["ok"] = bool(cap.isOpened() and cap.read()[0])
+        cap.release()
     return cams
 
 
@@ -323,6 +361,7 @@ if args.selftest:
 def capture_loop():
     global latest_frame
     cur_cam = None
+    good_cam = None  # last camera that opened, to fall back to
     cap = None
     prev_small = None
     n, t0 = 0, time.time()
@@ -332,17 +371,25 @@ def capture_loop():
                 cap.release()
             cur_cam = settings["camera"]
             latest_frame = None
-            src = int(cur_cam) if cur_cam.isdigit() else cur_cam
-            cap = cv2.VideoCapture(src)
+            prev_small = None
+            cap = open_cam(cur_cam)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 3840)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 2160)
             if not cap.isOpened():
-                state["status"] = f"cannot open camera {cur_cam}"
-                print("[cam]", state["status"], flush=True)
                 cap.release()
                 cap = None
+                label = next((c["label"] for c in CAMERAS if c["id"] == cur_cam), cur_cam)
+                if good_cam is not None and good_cam != cur_cam:
+                    state["cam_error"] = f"cannot open {label}, switched back"
+                    settings["camera"] = good_cam  # reopened on the next pass
+                else:
+                    state["cam_error"] = f"cannot open {label}, pick another camera"
+                print("[cam]", state["cam_error"], flush=True)
                 time.sleep(0.5)
                 continue
+            if cur_cam != good_cam:  # a fall-back keeps its "switched back" message
+                state["cam_error"] = None
+            good_cam = cur_cam
             print(f"[cam] #{cur_cam} {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}",
                   flush=True)
             n, t0 = 0, time.time()
@@ -515,12 +562,20 @@ def api_state():
                 "last_diff": state["last_diff"],
                 "last_latency": state["last_latency"],
                 "cam_fps": state["cam_fps"],
+                "cam_error": state["cam_error"],
                 "transcript": str(transcript_path.relative_to(ROOT)),
             },
             "paused": state["paused"],
             "settings": settings,
             "cameras": CAMERAS,
         }
+
+
+@app.post("/api/cameras/rescan")
+def api_cameras_rescan():
+    global CAMERAS
+    CAMERAS = list_cameras(in_use=settings["camera"])
+    return {"cameras": CAMERAS}
 
 
 @app.post("/api/pause")

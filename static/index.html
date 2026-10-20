@@ -25,6 +25,8 @@
 <div>
   <button id="pause">pause</button>
   <label>camera <select id="camera"></select></label>
+  <button id="camscan">rescan</button>
+  <span id="camerr" style="color:#c00"></span>
   <label><input type="checkbox" id="bw"> B&amp;W threshold</label>
   <label><input type="checkbox" id="invert"> invert (blackboard)</label>
   <label>min interval s <input type="number" id="interval" step="0.5" min="0" style="width:4em"></label>
@@ -58,12 +60,28 @@ const sendSettings = () => post("/api/settings", {
 });
 ["camera", "bw", "invert", "interval", "diff"].forEach(id => $(id).onchange = sendSettings);
 
+// cameras that gave no frame when probed are listed but disabled
+const fillCameras = (cams, current) => {
+  $("camera").innerHTML = (cams || []).map(c =>
+    `<option value="${esc(c.id)}"${c.ok === false ? " disabled" : ""}>${esc(c.label)}${c.ok === false ? " (no frames)" : ""}</option>`).join("");
+  $("camera").value = current;
+};
+$("camscan").onclick = async () => {
+  $("camscan").disabled = true; $("camscan").textContent = "scanning...";
+  const r = await post("/api/cameras/rescan");
+  fillCameras(r.cameras, $("camera").value);
+  $("camscan").disabled = false; $("camscan").textContent = "rescan";
+};
+
 async function tick() {
   try {
     const s = await (await fetch("/api/state")).json();
     const st = s.stats;
     $("stats").textContent = `backend=${st.backend} | ${st.status} | snapshots=${st.snapshots} | skipped(unchanged)=${st.skipped} | frame diff ${st.last_diff ?? "-"} | last OCR ${st.last_latency ?? "-"}s | pages ${st.pages_billed} (~$${st.est_cost}) | cam ${st.cam_fps} fps | transcript: ${st.transcript}`;
     $("proc").src = "/processed.jpg?" + Date.now();
+    $("camerr").textContent = st.cam_error || "";
+    // the server may switch back after a failed open; keep the dropdown truthful
+    if (settingsLoaded && document.activeElement !== $("camera")) $("camera").value = s.settings.camera;
     const h = $("hand");
     if (s.hand) {
       h.style.left = (s.hand[0] * 100) + "%";
@@ -73,8 +91,7 @@ async function tick() {
       h.style.display = "none";
     }
     if (!settingsLoaded) {
-      $("camera").innerHTML = (s.cameras || []).map(c => `<option value="${esc(c.id)}">${esc(c.label)}</option>`).join("");
-      $("camera").value = s.settings.camera;
+      fillCameras(s.cameras, s.settings.camera);
       $("bw").checked = s.settings.bw; $("invert").checked = s.settings.invert;
       $("interval").value = s.settings.interval; $("diff").value = s.settings.diff_threshold;
       $("pause").textContent = s.paused ? "resume" : "pause";

@@ -4,3 +4,5 @@ opencv-python
 numpy
 pillow
 requests
+beautifulsoup4
+cv2-enumerate-cameras
