@@ -11,7 +11,13 @@ camera (OpenCV) ─► latest frame ─► preprocess ─► changed? ─► Dat
 ```
 
 - One API request is in flight at a time. `--interval` (default 2.5 s) keeps you under the free tier's 25 requests/min.
-- Every request OCRs the whole board. Lines already on the list are subtracted, so a re-read of the same board adds nothing and the steps never repeat.
+- Every request OCRs the whole board, and a duplicate checker keeps only genuinely new lines:
+  - **Formatting variants are the same line:** `x^{2}` = `x^2`, `\frac{a}{b}` = `\frac a b`, plus spacing, `\left`/`\right` and trailing punctuation.
+  - **Half-written lines:** a line caught half-written is *completed* in place, not added twice.
+  - **Hand in the way:** a line partly covered by the hand is ignored.
+  - **Misreads:** a line misread on one pass (e.g. `m` → `rn`), at least `--dup-similarity` (default 0.85) similar, is ignored.
+  - **What still counts as new:** these merges only happen when the earlier reading just dropped out of view, so two similar lines that are both on the board stay two steps, and on short lines like `x=2` → `x=3` one changed character is a new step.
+  - Run `python app.py --selftest` to check the checker.
 - Frames whose 160 px thumbnail differs from the last OCR'd frame by less than `--diff-threshold` are skipped, so an unchanged board isn't billed.
 - The page shows the live feed, the exact preprocessed frame that was uploaded, and the steps so far rendered with KaTeX (the newest is highlighted). KaTeX also emits MathML, which screen readers can read. The page also shows pages billed and an estimated cost.
 - An empty board produces no step: nothing is rendered, no description of the photograph.
@@ -71,6 +77,7 @@ python app.py --camera 0
 | `--invert` | off | for chalk on blackboard |
 | `--max-side` | `1600` | resize long edge before upload |
 | `--timeout` | `60` | give up on one request after N seconds |
+| `--dup-similarity` | `0.85` | how similar a misread must be to count as the same line; `>1` turns fuzzy matching off |
 
 B&W, invert, interval, diff threshold and camera can also be changed live from the page. The camera list uses real names (System Profiler on macOS, cv2-enumerate-cameras on Windows/Linux), greys out cameras that give no frames (e.g. OBS Virtual Camera while OBS isn't sending), and has a rescan button. If a camera fails to open, the page says so and switches back to the last one that worked.
 

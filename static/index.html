@@ -46,7 +46,7 @@ const $ = id => document.getElementById(id);
 const esc = s => s.replace(/[&<>]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
 const tex = latex => katex.renderToString(latex, {displayMode: true, output: "htmlAndMathml", throwOnError: false});
 
-let lastSnap = 0, lastEqCount = 0, settingsLoaded = false;
+let lastSnap = 0, lastRev = -1, settingsLoaded = false;
 
 async function post(url, body) {
   const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body || {})});
@@ -98,9 +98,9 @@ async function tick() {
       settingsLoaded = true;
     }
     const eqs = s.equations;
-    if (eqs.length !== lastEqCount) {   // backend only appends lines it hasn't sent before
+    if (s.steps_rev !== lastRev) {   // bumped when a step is added or a half-written one completes
       $("steps").innerHTML = eqs.map(e => `<li value="${e.n}">${tex(e.latex)}</li>`).join("");
-      lastEqCount = eqs.length;
+      lastRev = s.steps_rev;
     }
     if (s.latest && s.latest.id !== lastSnap) {
       lastSnap = s.latest.id;

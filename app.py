@@ -5,6 +5,7 @@ camera -> latest frame -> preprocess -> change check -> Datalab (Chandra) -> LaT
 
 import argparse
 from collections import deque
+import difflib
 import io
 import json
 import os
@@ -49,6 +50,9 @@ p.add_argument("--host", default="127.0.0.1")
 p.add_argument("--port", type=int, default=8000)
 p.add_argument("--once", metavar="IMAGE", help="OCR a single image, print result, exit")
 p.add_argument("--selftest", action="store_true", help="check step ordering and exit")
+p.add_argument("--dup-similarity", type=float, default=0.85,
+               help="a new line this similar (0-1) to one that just dropped out of view is the "
+                    "same line misread, not a new step; >1 turns fuzzy matching off")
 p.add_argument("--hand", action="store_true",
                help="track the writing hand and order steps by it (off = reading order)")
 args = p.parse_args()
@@ -61,7 +65,9 @@ state = {
     "proc_jpg": None,        # latest preprocessed frame as jpeg bytes
     "latest": None,          # latest snapshot dict
     "equations": [],         # ordered unique equations across the lecture
-    "seen": set(),
+    "key2n": {},             # every canonical key seen -> step number
+    "visible": set(),        # step numbers on the board at the last snapshot
+    "steps_rev": 0,          # bumped whenever a step is added or completed
     "snap_count": 0,
     "skipped": 0,
     "last_diff": None,
@@ -271,8 +277,85 @@ class DatalabOCR:
         return blocks_from_json(res.get("json"), (pil.width, pil.height))
 
 
-def norm(e):
-    return re.sub(r"\s+", "", e)
+# ---------------------------------------------------------------- duplicate checker
+
+_SPACING = re.compile(r"\\(?:left|right|displaystyle|textstyle|quad|qquad)(?![A-Za-z])|\\[,;:! ]|~")
+_SINGLE_BRACED = re.compile(r"(?<!\\)\{(\\[A-Za-z]+|[A-Za-z0-9])\}")
+
+
+def canon(latex):
+    """Comparison key: the same line read twice by OCR should give the same key.
+
+    Drops whitespace, \\left/\\right, spacing commands and trailing punctuation,
+    folds \\dfrac/\\tfrac to \\frac and {x} to x, so x^{2} == x^2, \\frac{a}{b} == \\frac a b.
+    """
+    s = _SPACING.sub("", latex)
+    s = re.sub(r"\\[dt]frac", r"\\frac", s)
+    s = re.sub(r"\s+", "", s)
+    prev = None
+    while prev != s:
+        prev, s = s, _SINGLE_BRACED.sub(r"\1", s)
+    return s.rstrip(".,;")
+
+
+def _same_line(k, vanished, eqs):
+    """Was the new key k just a different reading of a line that dropped out?
+
+    Only lines visible in the previous snapshot and missing now are candidates,
+    so two similar lines that are both on the board stay two steps.
+    Returns (step number, "grew" | "dup") or (None, None).
+    """
+    best, best_score = (None, None), 0.0
+    for n in vanished:
+        e = eqs[n - 1]["key"]
+        if k.startswith(e):
+            how, score = "grew", 2.0      # caught half-written last time
+        elif e.startswith(k):
+            how, score = "dup", 1.5       # hand covering the end of the line
+        else:
+            score = difflib.SequenceMatcher(None, k, e).ratio()
+            how = "dup"                   # OCR jitter, e.g. m -> rn
+            if score < args.dup_similarity:
+                continue
+        if score > best_score:
+            best, best_score = (n, how), score
+    return best
+
+
+def merge_steps(book, steps, when):
+    """Fold one snapshot's lines into the step list. Returns (new, updated) items.
+
+    book holds equations, key2n (every key seen -> step number) and visible
+    (step numbers in the previous snapshot); merge_steps updates all three.
+    """
+    eqs, key2n = book["equations"], book["key2n"]
+    lines = {}
+    for b in steps:
+        k = canon(b["latex"])
+        if k and k not in lines:
+            lines[k] = b
+    present = {key2n[k] for k in lines if k in key2n}
+    vanished = [n for n in sorted(book["visible"]) if n not in present]
+    new, updated, visible = [], [], set(present)
+    for k, b in lines.items():
+        if k in key2n:
+            continue
+        n, how = _same_line(k, vanished, eqs)
+        if n is not None:
+            vanished.remove(n)
+            key2n[k] = n
+            visible.add(n)
+            if how == "grew":
+                eqs[n - 1].update(latex=b["latex"], key=k)
+                updated.append(eqs[n - 1])
+            continue
+        item = {"n": len(eqs) + 1, "time": when, "latex": b["latex"], "hand": b["hand"], "key": k}
+        eqs.append(item)
+        key2n[k] = item["n"]
+        visible.add(item["n"])
+        new.append(item)
+    book["visible"] = visible
+    return new, updated
 
 
 BLOCK_TYPES = {"equation", "text", "sectionheader", "listitem"}
@@ -348,6 +431,33 @@ def _selftest():
     got = blocks_from_json({"children": [caption]}, (10, 10))
     assert got[0]["latex"] == "" and "horse" in got[0]["text"], got
     assert order_steps(got, 0, 12) == [], "a caption must not become a step"
+    _selftest_dups()
+
+
+def _selftest_dups():
+    """The duplicate checker: re-reads merge, genuinely different lines don't."""
+    book = {"equations": [], "key2n": {}, "visible": set()}
+
+    def snap(*lines):
+        new, upd = merge_steps(book, [{"latex": x, "hand": None} for x in lines], "t")
+        return [e["latex"] for e in new], [(e["n"], e["latex"]) for e in upd]
+
+    assert canon(r"x^{2} + \frac{a}{b}.") == canon(r"x^2+\frac a b") == canon(r"x^2 +\dfrac{a}{b}")
+    assert canon(r"\left( a \right)\,b") == canon("(a)b")
+    F = r"\sum_{i=1}^n F_i = ma"
+    assert snap(F, "x^{2}+1") == ([F, "x^{2}+1"], [])
+    assert snap(r"\sum_{i=1}^{n} F_i=ma", r"x^2 + 1.") == ([], []), "spacing/brace variants"
+    assert snap(F, "x^2+1", "y = 2") == (["y = 2"], [])
+    assert snap(F, "x^2+1", "y=2x+1") == ([], [(3, "y=2x+1")]), "half-written line grew"
+    assert snap(r"\sum_{i=1}^n F_i = rna", "x^2+1", "y=2x+1") == ([], []), \
+        "one-letter misread of a visible line"
+    assert snap(F, "x^2+1", "y=2x") == ([], []), "hand covering the end of a line"
+    assert snap(F, "x^2+1", "y=2x+1", "y=2x+1+z") == (["y=2x+1+z"], []), \
+        "a longer line next to the short one is a new step"
+    assert snap("x=2") == (["x=2"], []), "board wiped, new line"
+    assert snap("x=3") == (["x=3"], []), "short lines: one changed character is a real change"
+    assert [e["latex"] for e in book["equations"]] == \
+        [F, "x^{2}+1", "y=2x+1", "y=2x+1+z", "x=2", "x=3"]
 
 
 if args.selftest:
@@ -473,22 +583,19 @@ def add_snapshot(steps, dt, shot_t):
         }
         state["latest"] = snap
         state["last_latency"] = snap["latency"]
-        new = []
-        for b in steps:              # whole board comes back; only unseen lines are steps
-            k = norm(b["latex"])
-            if k not in state["seen"]:
-                state["seen"].add(k)
-                item = {"n": len(state["equations"]) + 1, "time": snap["time"],
-                        "latex": b["latex"], "hand": b["hand"]}
-                state["equations"].append(item)
-                new.append(item)
+        # whole board comes back each time; the checker keeps only genuinely new lines
+        new, updated = merge_steps(state, steps, snap["time"])
+        if new or updated:
+            state["steps_rev"] += 1
         snap["steps"] = new
-    print(f"[ocr] #{snap['id']} {dt:.2f}s, {len(steps)} on board, {len(new)} new", flush=True)
-    if new:   # empty board writes nothing, so the transcript stays blank too
+    print(f"[ocr] #{snap['id']} {dt:.2f}s, {len(steps)} on board, {len(new)} new, "
+          f"{len(updated)} completed", flush=True)
+    if new or updated:   # empty board writes nothing, so the transcript stays blank too
         TRANSCRIPTS.mkdir(exist_ok=True)
         with open(transcript_path, "a", encoding="utf-8") as f:
             f.write(f"## Snapshot {snap['id']} @ {snap['time']} ({dt:.2f}s)\n\n"
-                    + "\n".join(f"{e['n']}. ${e['latex']}$" for e in new) + "\n\n")
+                    + "".join(f"{e['n']}. ${e['latex']}$\n" for e in new)
+                    + "".join(f"{e['n']}. (completed) ${e['latex']}$\n" for e in updated) + "\n")
 
 
 # ---------------------------------------------------------------- one-shot mode
@@ -551,6 +658,7 @@ def api_state():
         return {
             "latest": state["latest"],
             "equations": state["equations"],
+            "steps_rev": state["steps_rev"],
             "hand": state["hand"] if time.time() - state["hand_t"] < 2 else None,
             "stats": {
                 "status": state["status"],
